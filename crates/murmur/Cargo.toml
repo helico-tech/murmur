@@ -1,0 +1,29 @@
+[package]
+name = "murmur"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Murmur: eventually consistent replication of signed append-only logs among N peers. Sans-IO core with a deterministic network simulator."
+
+[lints]
+workspace = true
+
+[features]
+# The deterministic network simulator, for tests here and in crates that build on murmur.
+sim = []
+
+[dependencies]
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+postcard = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+data-encoding = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+murmur = { path = ".", features = ["sim"] }
+
+[[example]]
+name = "fuzz"
+required-features = ["sim"]

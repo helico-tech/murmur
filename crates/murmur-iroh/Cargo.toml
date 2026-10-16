@@ -1,0 +1,23 @@
+[package]
+name = "murmur-iroh"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Runs murmur swarms over iroh (QUIC, hole punching, relays), natively and in the browser."
+
+[lints]
+workspace = true
+
+[dependencies]
+murmur = { workspace = true }
+iroh = { workspace = true }
+n0-future = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+postcard = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+tokio = { workspace = true, features = ["sync", "rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
