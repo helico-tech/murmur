@@ -20,8 +20,7 @@ Protocol: [docs/murmur.md](docs/murmur.md). Decision record: [docs/adr/](docs/ad
 murmur = { git = "https://github.com/helico-tech/murmur", rev = "…" }
 murmur-iroh = { git = "https://github.com/helico-tech/murmur", rev = "…" }
 ```
-Pin a rev; bump it on purpose. With a private repo, set `net.git-fetch-with-cli = true` in
-`.cargo/config.toml` so cargo uses git's credentials.
+Pin a rev; bump it on purpose.
 
 ## Develop
 ```sh
