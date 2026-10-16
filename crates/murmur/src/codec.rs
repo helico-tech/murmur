@@ -16,7 +16,7 @@ use crate::limits::MAX_PAYLOAD;
 pub const LOG_MAGIC: &[u8; 4] = b"MRL1";
 
 /// Largest encoded entry.
-const MAX_ENTRY: usize = 32 + 10 + 10 + MAX_PAYLOAD + 64;
+pub(crate) const MAX_ENTRY: usize = 32 + 10 + 10 + MAX_PAYLOAD + 64;
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -51,6 +51,12 @@ pub fn encode_entry(e: &Entry, out: &mut Vec<u8>) {
 /// Reads one entry that fills all of `buf`. `None` for anything malformed or over the limits.
 /// The signature isn't checked (see `Entry::verify`).
 pub fn decode_entry(buf: &[u8]) -> Option<Entry> {
+    let (author, seq, payload, sig) = decode_parts(buf)?;
+    Some(Entry { author, seq, payload: payload.to_vec(), sig })
+}
+
+/// The parts of one encoded entry that fills all of `buf`, without copying the payload.
+pub(crate) fn decode_parts(buf: &[u8]) -> Option<(PeerId, u64, &[u8], [u8; 64])> {
     let author = PeerId(<[u8; 32]>::try_from(buf.get(..32)?).ok()?);
     let mut pos = 32;
     let seq = get_varint(buf, &mut pos)?;
@@ -58,13 +64,13 @@ pub fn decode_entry(buf: &[u8]) -> Option<Entry> {
     if seq == 0 || len > MAX_PAYLOAD {
         return None;
     }
-    let payload = buf.get(pos..pos.checked_add(len)?)?.to_vec();
+    let payload = buf.get(pos..pos.checked_add(len)?)?;
     pos += len;
     let sig = <[u8; 64]>::try_from(buf.get(pos..pos + 64)?).ok()?;
-    (pos + 64 == buf.len()).then_some(Entry { author, seq, payload, sig })
+    (pos + 64 == buf.len()).then_some((author, seq, payload, sig))
 }
 
-fn check(body: &[u8]) -> [u8; 4] {
+pub(crate) fn check(body: &[u8]) -> [u8; 4] {
     let h = blake3::hash(body);
     let mut c = [0u8; 4];
     c.copy_from_slice(&h.as_bytes()[..4]);
@@ -102,38 +108,82 @@ pub struct ParsedLog {
 
 /// Reads a log file. `None` if it isn't one (wrong magic); an empty file is an empty log.
 pub fn parse_log(bytes: &[u8]) -> Option<ParsedLog> {
+    let mut it = log_entries(bytes)?;
+    let entries = it.by_ref().collect();
+    Some(ParsedLog { entries, good_len: it.good_len(), damaged: it.damaged() })
+}
+
+/// Reads a log file one entry at a time, so a caller can restore a swarm without holding every
+/// entry at once: `swarm.restore(&mut it, false)`, then cut the file at `it.good_len()`.
+/// `None` if it isn't a log file (wrong magic); an empty file is an empty log.
+pub fn log_entries(bytes: &[u8]) -> Option<LogEntries<'_>> {
     if bytes.is_empty() {
-        return Some(ParsedLog::default());
+        return Some(LogEntries { bytes, pos: 0, good_len: 0, damaged: false });
     }
     if bytes.get(..4)? != LOG_MAGIC {
         return None;
     }
-    let mut out = ParsedLog { entries: Vec::new(), good_len: 4, damaged: false };
-    let mut pos = 4;
-    while pos < bytes.len() {
-        let record = (|| {
-            let len = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?) as usize;
-            if len > MAX_ENTRY {
-                return None;
-            }
-            let body = bytes.get(pos + 4..pos + 4 + len)?;
-            let sum = bytes.get(pos + 4 + len..pos + 8 + len)?;
-            (sum == check(body)).then_some(())?;
-            Some((decode_entry(body)?, 8 + len))
-        })();
-        match record {
-            Some((e, n)) => {
-                out.entries.push(e);
-                pos += n;
-                out.good_len = pos;
-            }
+    Some(LogEntries { bytes, pos: 4, good_len: 4, damaged: false })
+}
+
+/// The entries of a log file, oldest first (see [`log_entries`]).
+#[derive(Debug)]
+pub struct LogEntries<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    good_len: usize,
+    damaged: bool,
+}
+
+impl LogEntries<'_> {
+    /// Bytes read so far that form whole, good records (with the magic).
+    pub fn good_len(&self) -> usize {
+        self.good_len
+    }
+
+    /// The file went on after the good part (torn or damaged); reading stopped there.
+    pub fn damaged(&self) -> bool {
+        self.damaged
+    }
+}
+
+impl Iterator for LogEntries<'_> {
+    type Item = Entry;
+
+    fn next(&mut self) -> Option<Entry> {
+        if self.damaged || self.pos >= self.bytes.len() {
+            return None;
+        }
+        match read_record(self.bytes, self.pos) {
+            Some((body, n)) => match decode_entry(body) {
+                Some(e) => {
+                    self.pos += n;
+                    self.good_len = self.pos;
+                    Some(e)
+                }
+                None => {
+                    self.damaged = true;
+                    None
+                }
+            },
             None => {
-                out.damaged = true;
-                break;
+                self.damaged = true;
+                None
             }
         }
     }
-    Some(out)
+}
+
+/// The body of the record at `pos` and the record's whole length, if it is whole and its check
+/// matches.
+pub(crate) fn read_record(bytes: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+    let len = u32::from_le_bytes(bytes.get(pos..pos.checked_add(4)?)?.try_into().ok()?) as usize;
+    if len > MAX_ENTRY {
+        return None;
+    }
+    let body = bytes.get(pos + 4..pos + 4 + len)?;
+    let sum = bytes.get(pos + 4 + len..pos + 8 + len)?;
+    (sum == check(body)).then_some((body, 8 + len))
 }
 
 #[cfg(test)]
@@ -193,5 +243,21 @@ mod tests {
         assert!(p.damaged);
         assert_eq!(parse_log(b"{\"a\":1}\n"), None, "not a murmur log");
         assert_eq!(parse_log(&[]), Some(ParsedLog::default()));
+    }
+
+    #[test]
+    fn log_entries_streams_and_stops_at_damage() {
+        let es = entries(30);
+        let mut log = new_log();
+        log.extend(log_records(&es));
+        let full = log.len();
+        log.extend_from_slice(&[1, 2, 3]);
+        let mut it = log_entries(&log).unwrap_or_else(|| panic!("a log"));
+        let got: Vec<Entry> = it.by_ref().collect();
+        assert_eq!(got, es);
+        assert_eq!(it.good_len(), full);
+        assert!(it.damaged());
+        assert!(log_entries(b"nope").is_none());
+        assert_eq!(log_entries(&[]).map(|i| i.count()), Some(0));
     }
 }

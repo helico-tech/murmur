@@ -59,30 +59,33 @@ fn main() {
 
     let payload_mb = payload_bytes as f64 / 1e6;
     drop(entries);
-    let base = rss_mb();
     // Parse.
     let t = Instant::now();
     let parsed_json: usize = json.lines().filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()).count();
     let json_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
-    let parsed = codec::parse_log(&log).map(|p| p.entries).unwrap_or_default();
+    let parsed = codec::parse_log(&log).map(|p| p.entries.len()).unwrap_or_default();
     let log_ms = t.elapsed().as_secs_f64() * 1e3;
     println!("\nparse                 ms");
     println!("JSON lines           {json_ms:>8.0}  ({parsed_json} lines)");
-    println!("binary log           {log_ms:>8.0}  ({} entries)", parsed.len());
+    println!("binary log           {log_ms:>8.0}  ({parsed} entries)");
     drop(json);
-    drop(log);
 
-    // Restore and read back.
+    // Restore (streaming from the log bytes, so no list of every entry exists at once) and read
+    // back.
+    let base = rss_mb();
     let t = Instant::now();
     let mut swarm = Swarm::new(key.clone(), Identity::from_secret([99; 32]), Config::default(), 1);
-    let r = swarm.restore(parsed, false);
+    let r = match codec::log_entries(&log) {
+        Some(mut it) => swarm.restore(&mut it, false),
+        None => Default::default(),
+    };
     let restore_ms = t.elapsed().as_secs_f64() * 1e3;
+    let after = rss_mb();
     let t = Instant::now();
     let all = swarm.since(&Vector::new(), usize::MAX);
     let since_ms = t.elapsed().as_secs_f64() * 1e3;
     drop(all);
-    let after = rss_mb();
     println!("\nrestore {} entries in {restore_ms:.0} ms ({} rejected); since() in {since_ms:.0} ms", swarm.len(), r.rejected);
     println!(
         "memory of the restored swarm: {:.0} MB resident ({:.0} B/entry; payloads alone {payload_mb:.0} MB)",

@@ -1,7 +1,7 @@
 # Murmur protocol
 
 > Last updated: 2026-10-16. Code: `crates/murmur` (sans-IO core and simulator),
-> `crates/murmur-iroh` (transport). Decision: [ADR 0005](adr/0005-murmur-replication-library.md).
+> `crates/murmur-iroh` (transport). Decisions: [ADR 0001](adr/0001-murmur-replication-library.md).
 
 Murmur keeps a set of **signed, append-only, per-author logs** the same on every peer of a
 **swarm**, with no server. It is eventually consistent: when changes stop and the online peers can
@@ -68,6 +68,14 @@ implies holding `1..n`).
 Accepting an entry: the signature must be valid for this swarm (else ban the sender), the payload
 within limits, and `seq` the author's next one. A different entry for a `seq` we already hold is
 a **conflict**: the first one seen is kept and the app is told.
+
+## Memory
+
+Each author's log is packed: its entries sit back to back in byte chunks of about 32 KiB, each as
+`payload ‖ signature`, with a 2-byte start offset per entry (author and seq are implicit). That is
+the payload plus ~66 bytes per entry. Entries are decoded into an `Entry` when asked for (`get`,
+`since`, answering a `Have`, eager push); duplicates and conflicts are checked against the stored
+bytes. The out-of-order buffer holds whole entries. `Swarm::ram_bytes()` reports the packed size.
 
 ## Overlay
 

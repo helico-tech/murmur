@@ -399,12 +399,20 @@ impl Swarm {
         self.logs.bytes()
     }
 
+    /// Bytes of entry data held in memory: payloads and signatures in the packed logs (not the
+    /// entries waiting for a gap). For diagnostics.
+    pub fn ram_bytes(&self) -> usize {
+        self.logs.ram()
+    }
+
     /// Goes up by one every time entries are added.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub fn get(&self, author: &PeerId, seq: u64) -> Option<&Arc<Entry>> {
+    /// The entry `seq` of `author`, if we hold it. (Decoded from the packed log, so each call
+    /// makes a new `Arc`.)
+    pub fn get(&self, author: &PeerId, seq: u64) -> Option<Arc<Entry>> {
         self.logs.get(author, seq)
     }
 
