@@ -32,6 +32,7 @@
 //!   sent; every entry and flash signature is checked; sizes are capped; a peer that sends
 //!   something invalid is disconnected and banned for a while. Nothing panics on input.
 
+pub mod codec;
 mod entry;
 mod id;
 mod logs;

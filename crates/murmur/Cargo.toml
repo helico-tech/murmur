@@ -23,7 +23,11 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 murmur = { path = ".", features = ["sim"] }
+serde_json = "1"
 
 [[example]]
 name = "fuzz"
 required-features = ["sim"]
+
+[[example]]
+name = "bench"
