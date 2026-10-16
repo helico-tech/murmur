@@ -71,11 +71,29 @@ a **conflict**: the first one seen is kept and the app is told.
 
 ## Memory
 
-Each author's log is packed: its entries sit back to back in byte chunks of about 32 KiB, each as
+Each author's log is packed: its entries sit back to back in byte chunks, each as
 `payload ‖ signature`, with a 2-byte start offset per entry (author and seq are implicit). That is
 the payload plus ~66 bytes per entry. Entries are decoded into an `Entry` when asked for (`get`,
 `since`, answering a `Have`, eager push); duplicates and conflicts are checked against the stored
 bytes. The out-of-order buffer holds whole entries. `Swarm::ram_bytes()` reports the packed size.
+
+**Reading old entries back** (ADR 0002). A `Storage` may say it can read (`can_read`, `heads`,
+`read`; the defaults can't). Then:
+
+- The swarm tracks per author the highest seq the storage confirmed (an `Ok` append of a run that
+  continues it). Only entries up to there may leave memory; a failed append keeps them in memory.
+- It keeps about `ram_window` (256 KiB) of each author's newest entries in memory, in chunks of
+  `ram_window / 8` (256 B to 32 KiB), and drops whole older chunks.
+- Older entries are read through the storage when needed: answering `Have` (in batches of 64),
+  eager push to a neighbour a little behind, duplicate and conflict checks, `get`, `since`.
+- `load()` starts a swarm from such a storage: its `heads` become the vector; nothing is read.
+  `replay(from, f)` walks the whole log in batches without holding it (use it to fold on start);
+  `try_since` returns read errors. `since` and `get` can't: on a failed read they return nothing
+  and queue `Event::StorageFailed`.
+- `murmur::file::FileStorage` (native) is such a storage on the `codec` log format, with an index
+  author/seq → offset and length (8 B per entry) built at open; a torn tail is cut at open.
+- A storage that can't read changes nothing: every entry stays in memory, `restore` keeps all
+  it is given. Browsers stay there: their storage can't be read synchronously.
 
 ## Overlay
 
@@ -117,7 +135,7 @@ they saw; copies can differ for that one entry.
 
 ## Testing
 
-- Unit tests per module (codec fuzzing, logs, vectors, signatures).
+- Unit tests per module (codec fuzzing, packed logs and windows, the log file, vectors, signatures).
 - `tests/hostile.rs`: outsiders, forged and cross-swarm entries, protocol violations, lying
   `Have`s, replays, junk peer lists, and a random-abuse loop (nothing panics, limits hold).
 - `tests/sim.rs` in the deterministic simulator (virtual time, latency, failing dials, breaking
@@ -130,4 +148,9 @@ they saw; copies can differ for that one entry.
   - **chaos**: random publishes, churn, restarts, partitions and flaky links, then everyone must
     converge with intact, identical data. `MURMUR_CHAOS_SEEDS=1000` (default 24),
     `MURMUR_CHAOS_SEED=n` for one run, `MURMUR_CHAOS_SALT` for a fresh set.
+  - reading peers: small windows, a late joiner served from storage, restarts with `load`, a
+    wiped reading peer; chaos runs a third of the seeds with some and a third with only reading
+    peers (windows of 0–4 KB).
+- `tests/file.rs`: swarms on `FileStorage` (window boundary, reopen and `replay`, a peer served
+  from the file, a torn file healed by a peer).
 - `crates/murmur-iroh/tests/local.rs`: real QUIC endpoints on localhost.

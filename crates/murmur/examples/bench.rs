@@ -4,7 +4,11 @@
 //! Makes N signed entries (payloads of about BYTES, from N authors), then measures for the
 //! JSON-lines store format the apps used first (hex author, base64 payload and signature) and for
 //! the binary log ([`murmur::codec`]): bytes on disk, time to parse, and then the time and memory
-//! (resident set) to restore a `Swarm` and read everything back with `since`.
+//! (resident set) to restore a `Swarm` and read everything back with `since` and `replay`.
+//!
+//! With `--file`, the swarm runs on [`murmur::file::FileStorage`] instead (phase 2 of issue 0001):
+//! the log is written to a temporary file, opened (indexed), and the swarm `load`s from it, keeping
+//! only `Config::ram_window` bytes per author in memory.
 
 use std::time::Instant;
 
@@ -71,6 +75,10 @@ fn main() {
     println!("binary log           {log_ms:>8.0}  ({parsed} entries)");
     drop(json);
 
+    if std::env::args().any(|a| a == "--file") {
+        return on_file(key, log, n, payload_mb);
+    }
+
     // Restore (streaming from the log bytes, so no list of every entry exists at once) and read
     // back.
     let base = rss_mb();
@@ -82,14 +90,63 @@ fn main() {
     };
     let restore_ms = t.elapsed().as_secs_f64() * 1e3;
     let after = rss_mb();
-    let t = Instant::now();
-    let all = swarm.since(&Vector::new(), usize::MAX);
-    let since_ms = t.elapsed().as_secs_f64() * 1e3;
-    drop(all);
-    println!("\nrestore {} entries in {restore_ms:.0} ms ({} rejected); since() in {since_ms:.0} ms", swarm.len(), r.rejected);
+    println!("\nrestore {} entries in {restore_ms:.0} ms ({} rejected)", swarm.len(), r.rejected);
     println!(
-        "memory of the restored swarm: {:.0} MB resident ({:.0} B/entry; payloads alone {payload_mb:.0} MB)",
+        "memory of the restored swarm: {:.0} MB resident ({:.0} B/entry; payloads alone {payload_mb:.0} MB; packed {:.0} MB)",
+        after - base,
+        (after - base) * 1e6 / n as f64,
+        swarm.ram_bytes() as f64 / 1e6
+    );
+    reads(&swarm);
+    drop(log);
+}
+
+/// Times reading back: everything at once, a full replay, and one catch-up batch.
+fn reads(swarm: &Swarm) {
+    let t = Instant::now();
+    let all = swarm.try_since(&Vector::new(), usize::MAX).unwrap_or_default();
+    let since_ms = t.elapsed().as_secs_f64() * 1e3;
+    let all = all.len(); // Freeing a million entries takes a while; not part of `since`.
+    let t = Instant::now();
+    let mut bytes = 0usize;
+    let replayed = swarm.replay(&Vector::new(), |e| bytes += e.payload.len()).unwrap_or(0);
+    let replay_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    let batch = swarm.try_since(&Vector::new(), 4096).map(|v| v.len()).unwrap_or(0);
+    let batch_ms = t.elapsed().as_secs_f64() * 1e3;
+    println!("since() all {all} in {since_ms:.0} ms; replay {replayed} in {replay_ms:.0} ms; since() of the oldest {batch} in {batch_ms:.1} ms");
+}
+
+/// Phase 2: the swarm on a log file, loading instead of restoring.
+fn on_file(key: SwarmKey, log: Vec<u8>, n: usize, payload_mb: f64) {
+    let path = std::env::temp_dir().join(format!("murmur-bench-{}.log", std::process::id()));
+    if let Err(e) = std::fs::write(&path, &log) {
+        println!("can't write {}: {e}", path.display());
+        return;
+    }
+    drop(log);
+    let base = rss_mb();
+    let t = Instant::now();
+    let file = match murmur::file::FileStorage::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("can't open {}: {e}", path.display());
+            return;
+        }
+    };
+    let open_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    let mut swarm = Swarm::new(key, Identity::from_secret([99; 32]), Config::default(), 1);
+    swarm.set_storage(Box::new(file));
+    let loaded = swarm.load().map(|r| r.accepted).unwrap_or(0);
+    let load_ms = t.elapsed().as_secs_f64() * 1e3;
+    let after = rss_mb();
+    println!("\nfile storage: open (index) in {open_ms:.0} ms, load {loaded} entries in {load_ms:.1} ms");
+    println!(
+        "memory of the swarm and its file index: {:.1} MB resident ({:.0} B/entry; payloads alone {payload_mb:.0} MB)",
         after - base,
         (after - base) * 1e6 / n as f64
     );
+    reads(&swarm);
+    let _ = std::fs::remove_file(&path);
 }

@@ -34,9 +34,12 @@
 
 pub mod codec;
 mod entry;
+#[cfg(not(target_family = "wasm"))]
+pub mod file;
 mod id;
 mod logs;
 mod rng;
+mod storage;
 mod swarm;
 mod vector;
 pub mod wire;
@@ -48,7 +51,8 @@ pub use rng::Rng;
 
 pub use entry::{Entry, Flash, FlashKind};
 pub use id::{Identity, PeerId, SwarmId, SwarmKey, verify};
-pub use swarm::{Action, CloseReason, Config, ConnId, Event, PublishError, Restored, Stats, Storage, Swarm};
+pub use storage::Storage;
+pub use swarm::{Action, CloseReason, Config, ConnId, Event, PublishError, Restored, Stats, Swarm};
 pub use vector::Vector;
 pub use wire::Message;
 

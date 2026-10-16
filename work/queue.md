@@ -1,5 +1,6 @@
 # Queue
 
-1. [0001 Logs on disk](issues/0001-logs-on-disk.md) — the memory fix (see 0005's results)
-2. [0003 Lazy push](issues/0003-lazy-push.md)
-3. [0002 Rate limits](issues/0002-rate-limits.md)
+1. [0003 Lazy push](issues/0003-lazy-push.md)
+2. [0002 Rate limits](issues/0002-rate-limits.md)
+3. [0006 Faster replay from FileStorage](issues/0006-faster-file-replay.md)
+4. [0007 A reading storage for browsers](issues/0007-reading-storage-in-browsers.md)

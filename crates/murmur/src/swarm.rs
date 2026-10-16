@@ -1,12 +1,14 @@
 //! The swarm state machine: one peer's view of one swarm.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::entry::{Entry, Flash, FlashKind};
 use crate::id::{Identity, PeerId, SwarmId, SwarmKey};
-use crate::logs::{Insert, Logs};
+use crate::logs::{Insert, Logs, chunk_for};
 use crate::rng::Rng;
+use crate::storage::Storage;
 use crate::vector::Vector;
 use crate::wire::{Message, PeerHint};
 use crate::{PROTOCOL_VERSION, limits};
@@ -82,6 +84,11 @@ pub struct Config {
     pub event_limit: usize,
     /// How long a peer's unproven claim that we lost entries of our own log blocks publishing.
     pub claim_grace: u64,
+    /// With a storage that can read ([`Storage::can_read`]): about how many bytes of each
+    /// author's newest entries stay in memory; older ones are read back through the storage when
+    /// needed. Without one, every entry stays in memory. Logs are packed in chunks of
+    /// `ram_window / 8` bytes (256 B to 32 KiB).
+    pub ram_window: usize,
 }
 
 impl Default for Config {
@@ -117,6 +124,7 @@ impl Default for Config {
             peers_sample: 16,
             event_limit: 10_000,
             claim_grace: 30_000,
+            ram_window: 256 << 10,
         }
     }
 }
@@ -193,7 +201,8 @@ pub enum Event {
         author: PeerId,
         seq: u64,
     },
-    /// The storage hook failed; the entries are still held in memory.
+    /// The storage failed. Writing: the entries are still held in memory. Reading old entries
+    /// back: what needed them (an answer to a peer, [`Swarm::since`], [`Swarm::get`]) got less.
     StorageFailed(String),
 }
 
@@ -209,11 +218,6 @@ pub enum PublishError {
     /// our next seq. Call [`Swarm::assume_fresh`] for a new identity, or wait for a peer.
     #[error("not synced yet: connect to a peer first")]
     NotSynced,
-}
-
-/// Where accepted entries are persisted. Called once per accepted batch (including our own).
-pub trait Storage: Send {
-    fn append(&mut self, entries: &[Arc<Entry>]) -> Result<(), String>;
 }
 
 /// Counters, for tests and diagnostics.
@@ -284,6 +288,9 @@ pub struct Swarm {
     events: VecDeque<Event>,
     events_dropped: u64,
     storage: Option<Box<dyn Storage>>,
+    /// Failed reads from storage in calls that can't change the swarm (`since`, `get`); they
+    /// become `StorageFailed` events.
+    read_errors: Cell<Vec<String>>,
     hint: Vec<u8>,
     revision: u64,
     /// The highest seq of our own log seen in a signed entry (proof that we lost data).
@@ -325,12 +332,13 @@ impl Swarm {
         let salt = my_id.0.first_chunk::<8>().map(|b| u64::from_le_bytes(*b)).unwrap_or(0);
         let rng = Rng::new(seed ^ salt);
         let next_rotate = 0;
+        let logs = Logs::new(chunk_for(cfg.ram_window));
         Swarm {
             key,
             me,
             my_id,
             cfg,
-            logs: Logs::default(),
+            logs,
             links: BTreeMap::new(),
             peers: BTreeMap::new(),
             rng,
@@ -338,6 +346,7 @@ impl Swarm {
             events: VecDeque::new(),
             events_dropped: 0,
             storage: None,
+            read_errors: Cell::new(Vec::new()),
             hint: Vec::new(),
             revision: 0,
             own_seen: 0,
@@ -356,8 +365,11 @@ impl Swarm {
         }
     }
 
+    /// Where new entries are written (see [`Storage`]). If it can read, old entries may leave
+    /// memory once it holds them; to start from what it already holds, call [`Swarm::load`].
     pub fn set_storage(&mut self, storage: Box<dyn Storage>) {
         self.storage = Some(storage);
+        self.logs.forget_durable();
     }
 
     /// How peers can reach us (opaque; sent in `Hello` and passed on in peer exchange).
@@ -385,7 +397,7 @@ impl Swarm {
         self.logs.vector()
     }
 
-    /// Number of entries held.
+    /// Number of entries held (in memory or in a storage that can read).
     pub fn len(&self) -> u64 {
         self.logs.len()
     }
@@ -394,7 +406,8 @@ impl Swarm {
         self.logs.len() == 0
     }
 
-    /// Payload bytes held.
+    /// Payload bytes held. (After [`Swarm::load`], only of the entries added since: the storage
+    /// doesn't report sizes.)
     pub fn bytes(&self) -> usize {
         self.logs.bytes()
     }
@@ -412,13 +425,48 @@ impl Swarm {
 
     /// The entry `seq` of `author`, if we hold it. (Decoded from the packed log, so each call
     /// makes a new `Arc`.)
+    /// If it must be read from storage and that fails: `None`, and a [`Event::StorageFailed`].
     pub fn get(&self, author: &PeerId, seq: u64) -> Option<Arc<Entry>> {
-        self.logs.get(author, seq)
+        self.logs.get(author, seq, self.storage.as_deref()).unwrap_or_else(|e| {
+            self.read_failed(e);
+            None
+        })
     }
 
     /// Entries the holder of `known` lacks (oldest first per author), up to `max`.
+    ///
+    /// With a storage that can read, old entries are read through it. If that fails this returns
+    /// nothing at all (never a part) and queues a [`Event::StorageFailed`]; use
+    /// [`Swarm::try_since`] or [`Swarm::replay`] to get the error.
     pub fn since(&self, known: &Vector, max: usize) -> Vec<Arc<Entry>> {
-        self.logs.since(known, usize::MAX, max)
+        self.try_since(known, max).unwrap_or_else(|e| {
+            self.read_failed(e);
+            Vec::new()
+        })
+    }
+
+    /// [`Swarm::since`], with an error if old entries can't be read from storage.
+    pub fn try_since(&self, known: &Vector, max: usize) -> Result<Vec<Arc<Entry>>, String> {
+        match self.logs.since(known, usize::MAX, max, self.storage.as_deref()) {
+            (out, None) => Ok(out),
+            (_, Some(e)) => Err(e),
+        }
+    }
+
+    /// Calls `f` with every entry the holder of `from` lacks (`Vector::new()`: all of them),
+    /// author by author, oldest first per author, reading old entries from storage in batches.
+    /// Unlike [`Swarm::since`] it never holds them all at once: use it to fold the log on start.
+    /// Returns how many entries `f` saw, or the first read error (after `f` saw some).
+    pub fn replay(&self, from: &Vector, f: impl FnMut(&Entry)) -> Result<u64, String> {
+        self.logs.replay(from, f, self.storage.as_deref())
+    }
+
+    fn read_failed(&self, e: String) {
+        let mut v = self.read_errors.take();
+        if v.len() < 16 {
+            v.push(e);
+        }
+        self.read_errors.set(v);
     }
 
     /// Entries waiting for a gap to fill.
@@ -511,6 +559,9 @@ impl Swarm {
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
+        for e in self.read_errors.take() {
+            self.event(Event::StorageFailed(e));
+        }
         self.events.pop_front()
     }
 
@@ -519,13 +570,17 @@ impl Swarm {
     }
 
     pub fn has_events(&self) -> bool {
-        !self.events.is_empty()
+        let errors = self.read_errors.take();
+        let any = !errors.is_empty();
+        self.read_errors.set(errors);
+        any || !self.events.is_empty()
     }
 
     // ------------------------------------------------------------------ setup
 
-    /// Loads entries from storage. They are not written back. With `verify`, signatures are
-    /// checked (slower; use it when the storage could have been tampered with).
+    /// Loads entries from storage. They are not written back, and all of them stay in memory
+    /// (even with a storage that can read: use [`Swarm::load`] for that). With `verify`,
+    /// signatures are checked (slower; use it when the storage could have been tampered with).
     pub fn restore(&mut self, entries: impl IntoIterator<Item = Entry>, verify: bool) -> Restored {
         let mut r = Restored::default();
         let swarm = self.key.id();
@@ -535,7 +590,7 @@ impl Swarm {
                 r.rejected += 1;
                 continue;
             }
-            match self.logs.insert(Arc::new(e)) {
+            match self.logs.insert(Arc::new(e), self.storage.as_deref()) {
                 Insert::Appended(v) => {
                     added += v.len();
                     for e in &v {
@@ -546,6 +601,7 @@ impl Swarm {
                 }
                 Insert::Conflict => r.conflicts += 1,
                 Insert::Dropped => r.rejected += 1,
+                Insert::Unread(e) => self.event(Event::StorageFailed(e)),
                 Insert::Duplicate | Insert::Buffered => {}
             }
         }
@@ -557,6 +613,33 @@ impl Swarm {
         }
         self.trim_peers();
         r
+    }
+
+    /// Starts from what the storage holds, if it can read (see [`Storage::can_read`]): its
+    /// [`Storage::heads`] become our logs, and no entry is read until it is needed. Call it on a
+    /// new swarm after [`Swarm::set_storage`], instead of [`Swarm::restore`]; then fold the log
+    /// with [`Swarm::replay`]. Fails if there is no such storage or the swarm holds entries.
+    pub fn load(&mut self) -> Result<Restored, String> {
+        let Some(st) = self.storage.as_deref() else { return Err("no storage set".into()) };
+        if !st.can_read() {
+            return Err("the storage can't read".into());
+        }
+        if !self.logs.is_empty() {
+            return Err("load needs a swarm that holds no entries yet".into());
+        }
+        let heads = st.heads()?;
+        self.logs.load(&heads);
+        for a in heads.authors() {
+            if *a != self.my_id {
+                self.peers.entry(*a).or_default();
+            }
+        }
+        let accepted = usize::try_from(self.logs.len()).unwrap_or(usize::MAX);
+        if accepted > 0 {
+            self.revision += 1;
+        }
+        self.trim_peers();
+        Ok(Restored { accepted, ..Restored::default() })
     }
 
     /// Restricts connections to these peers (`None`: anyone who proves the swarm secret).
@@ -619,7 +702,7 @@ impl Swarm {
             return Err(PublishError::Behind { have, seen });
         }
         let e = Arc::new(Entry::sign(&self.key.id(), &self.me, have + 1, payload));
-        if let Insert::Appended(v) = self.logs.insert(e.clone()) {
+        if let Insert::Appended(v) = self.logs.insert(e.clone(), self.storage.as_deref()) {
             self.accepted(v, None, now);
         }
         Ok(e)
@@ -943,9 +1026,13 @@ impl Swarm {
                 self.own_seen = self.own_seen.max(e.seq);
             }
             let (author, seq) = (e.author, e.seq);
-            match self.logs.insert(e) {
+            match self.logs.insert(e, self.storage.as_deref()) {
                 Insert::Appended(v) => added.extend(v),
                 Insert::Duplicate => self.stats.duplicates_received += 1,
+                Insert::Unread(e) => {
+                    self.stats.duplicates_received += 1;
+                    self.event(Event::StorageFailed(e));
+                }
                 Insert::Conflict => self.event(Event::Conflict { author, seq }),
                 Insert::Buffered | Insert::Dropped => gap = true,
             }
@@ -1023,10 +1110,20 @@ impl Swarm {
 
     /// New entries are in the log: store them, tell the app, and push them on.
     fn accepted(&mut self, added: Vec<Arc<Entry>>, source: Option<ConnId>, _now: u64) {
-        if let Some(s) = self.storage.as_mut()
-            && let Err(e) = s.append(&added)
-        {
-            self.event(Event::StorageFailed(e));
+        let stored = match self.storage.as_mut().map(|s| s.append(&added)) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                self.event(Event::StorageFailed(e));
+                false
+            }
+            None => false,
+        };
+        if stored {
+            self.logs.stored(&added);
+            if self.storage.as_ref().is_some_and(|s| s.can_read()) {
+                let authors: BTreeSet<PeerId> = added.iter().map(|e| e.author).collect();
+                self.logs.evict(&authors, self.cfg.ram_window);
+            }
         }
         self.revision += 1;
         self.event(Event::Appended { count: added.len() });
@@ -1043,6 +1140,7 @@ impl Swarm {
         self.trim_peers();
         let conns: Vec<ConnId> =
             self.links.iter().filter(|(c, l)| Some(**c) != source && l.state == LinkState::Active && l.got_have).map(|(c, _)| *c).collect();
+        let mut failed = Vec::new();
         for c in conns {
             let mut out = Vec::new();
             if let Some(l) = self.links.get_mut(&c) {
@@ -1055,22 +1153,34 @@ impl Swarm {
                     if first.saturating_sub(from) > self.cfg.eager_gap {
                         continue;
                     }
-                    out.extend(self.logs.range(a, from, *last));
-                    l.known.raise(*a, *last);
+                    match self.logs.range(a, from, *last, self.storage.as_deref()) {
+                        Ok(v) => {
+                            out.extend(v);
+                            l.known.raise(*a, *last);
+                        }
+                        // It pulls what it lacks instead.
+                        Err(e) => failed.push(e),
+                    }
                 }
             }
             self.send_entries(c, out);
+        }
+        for e in failed {
+            self.event(Event::StorageFailed(e));
         }
     }
 
     /// Sends what the peer on `conn` lacks, up to `budget` bytes.
     fn push_missing(&mut self, conn: ConnId, budget: usize) {
         let Some(l) = self.links.get_mut(&conn) else { return };
-        let out = self.logs.since(&l.known, budget, usize::MAX);
+        let (out, failed) = self.logs.since(&l.known, budget, usize::MAX, self.storage.as_deref());
         for e in &out {
             l.known.raise(e.author, e.seq);
         }
         self.send_entries(conn, out);
+        if let Some(e) = failed {
+            self.event(Event::StorageFailed(e));
+        }
     }
 
     fn send_entries(&mut self, conn: ConnId, entries: Vec<Arc<Entry>>) {

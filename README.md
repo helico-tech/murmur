@@ -6,7 +6,9 @@ log. Used by [OpenTeams](https://github.com/helico-tech/openteams) and Thime.
 
 - **`murmur`**: the sans-IO core. A `Swarm` per group of peers: a small random overlay, instant
   push of new entries, version vectors with digests, windowed catch-up, anti-entropy, presence
-  and app flashes, allow-lists and bans. No I/O, threads or clock inside.
+  and app flashes, allow-lists and bans. No I/O, threads or clock inside. Logs are packed in
+  memory (~payload + 66 B per entry); with a storage that can read back (e.g. the native
+  `file::FileStorage`), only a recent window per author stays in memory.
 - **`murmur-iroh`**: runs swarms over [iroh](https://iroh.computer) (QUIC, hole punching, relays),
   natively and in the browser (wasm); plus a direct request/answer protocol ("knock").
 - A deterministic network simulator (feature `sim`): bandwidth, slow and flapping peers, NAT,

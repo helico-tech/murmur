@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use crate::entry::Entry;
 use crate::id::{Identity, PeerId, SwarmKey};
 use crate::rng::Rng;
-use crate::swarm::{Action, Config, ConnId, Event, PublishError, Storage, Swarm};
+use crate::storage::Storage;
+use crate::swarm::{Action, Config, ConnId, Event, PublishError, Swarm};
 use crate::vector::Vector;
 use crate::wire;
 
@@ -48,6 +49,9 @@ pub struct Net {
     pub skew: u64,
     /// Share of nodes that can't accept incoming connections (NAT, no relay).
     pub nat: f64,
+    /// Share of nodes whose storage can read back ([`MemReader`]): they keep only about
+    /// `Config::ram_window` bytes per author in memory and restart with `Swarm::load`.
+    pub reading: f64,
 }
 
 impl Default for Net {
@@ -65,6 +69,7 @@ impl Default for Net {
             queue_limit: 4096,
             skew: 0,
             nat: 0.0,
+            reading: 0.0,
         }
     }
 }
@@ -82,6 +87,9 @@ pub struct Profile {
     pub nat: bool,
     /// Corrupts some of what it sends (bad signatures, lying vectors).
     pub evil: bool,
+    /// Uses a storage that can read back (see [`Net::reading`]); takes effect at the next
+    /// restart when changed later.
+    pub reading: bool,
 }
 
 /// Persists into a shared Vec, so the simulator can restart a node from it.
@@ -93,6 +101,66 @@ impl Storage for MemStorage {
         let mut v = self.0.lock().map_err(|_| "poisoned".to_string())?;
         v.extend(entries.iter().map(|e| (**e).clone()));
         Ok(())
+    }
+}
+
+impl MemStorage {
+    /// A storage over the same entries that can also read them back: an in-memory stand-in for
+    /// `murmur::file::FileStorage`, with the same rules (indexed when made, already stored entries
+    /// skipped, gaps kept but not indexed).
+    pub fn reader(&self) -> MemReader {
+        let mut index: HashMap<PeerId, Vec<usize>> = HashMap::new();
+        if let Ok(v) = self.0.lock() {
+            for (i, e) in v.iter().enumerate() {
+                MemReader::index(&mut index, e, i);
+            }
+        }
+        MemReader { log: self.clone(), index }
+    }
+}
+
+/// See [`MemStorage::reader`].
+pub struct MemReader {
+    log: MemStorage,
+    /// Per author, the position in the log of seq 1, 2, 3…
+    index: HashMap<PeerId, Vec<usize>>,
+}
+
+impl MemReader {
+    fn index(index: &mut HashMap<PeerId, Vec<usize>>, e: &Entry, at: usize) {
+        let have = index.get(&e.author).map_or(0, |v| v.len() as u64);
+        if e.seq == have + 1 {
+            index.entry(e.author).or_default().push(at);
+        }
+    }
+}
+
+impl Storage for MemReader {
+    fn append(&mut self, entries: &[Arc<Entry>]) -> Result<(), String> {
+        let mut v = self.log.0.lock().map_err(|_| "poisoned".to_string())?;
+        for e in entries {
+            if e.seq <= self.index.get(&e.author).map_or(0, |v| v.len() as u64) {
+                continue;
+            }
+            Self::index(&mut self.index, e, v.len());
+            v.push((**e).clone());
+        }
+        Ok(())
+    }
+
+    fn can_read(&self) -> bool {
+        true
+    }
+
+    fn heads(&self) -> Result<Vector, String> {
+        Ok(self.index.iter().map(|(a, v)| (*a, v.len() as u64)).collect())
+    }
+
+    fn read(&self, author: &PeerId, from: u64, max: usize) -> Result<Vec<Entry>, String> {
+        let v = self.log.0.lock().map_err(|_| "poisoned".to_string())?;
+        let at = self.index.get(author).map(Vec::as_slice).unwrap_or_default();
+        let skip = usize::try_from(from.max(1) - 1).unwrap_or(usize::MAX);
+        Ok(at.iter().skip(skip).take(max).filter_map(|i| v.get(*i).cloned()).collect())
     }
 }
 
@@ -208,9 +276,10 @@ impl Sim {
             skew,
             nat: self.net.nat > 0.0 && self.rng.chance(self.net.nat),
             evil: false,
+            reading: self.net.reading > 0.0 && self.rng.chance(self.net.reading),
         };
         let storage = MemStorage::default();
-        let mut swarm = self.make_swarm(&secret, &storage, i as u64);
+        let mut swarm = self.make_swarm(&secret, &storage, i as u64, profile.reading);
         swarm.assume_fresh();
         self.ids.insert(swarm.id(), i);
         self.nodes.push(Node { swarm, online: true, storage, group: 0, bootstrap: Vec::new(), events: Vec::new(), profile, secret, restarts: 0 });
@@ -220,10 +289,14 @@ impl Sim {
         i
     }
 
-    fn make_swarm(&mut self, secret: &[u8; 32], storage: &MemStorage, salt: u64) -> Swarm {
+    fn make_swarm(&mut self, secret: &[u8; 32], storage: &MemStorage, salt: u64, reading: bool) -> Swarm {
         let mut s =
             Swarm::new(self.key.clone(), Identity::from_secret(*secret), self.cfg.clone(), self.seed ^ salt.wrapping_mul(0x51_7cc1_b727_220a));
-        s.set_storage(Box::new(storage.clone()));
+        if reading {
+            s.set_storage(Box::new(storage.reader()));
+        } else {
+            s.set_storage(Box::new(storage.clone()));
+        }
         s
     }
 
@@ -352,17 +425,26 @@ impl Sim {
     fn restart_with(&mut self, i: usize, keep: bool) {
         let Some(n) = self.nodes.get(i) else { return };
         let was_online = n.online;
-        let (secret, storage, bootstrap) = (n.secret, n.storage.clone(), n.bootstrap.clone());
+        let (secret, storage, bootstrap, reading) = (n.secret, n.storage.clone(), n.bootstrap.clone(), n.profile.reading);
         // Apps keep the address book with the data; a wipe loses both.
         let book = if keep { n.swarm.address_book(self.now) } else { Vec::new() };
         self.drop_all(i);
         if !keep && let Ok(mut v) = storage.0.lock() {
             v.clear();
         }
-        let stored: Vec<Entry> = storage.0.lock().map(|v| v.clone()).unwrap_or_default();
         let salt = (i as u64) << 32 | self.rng.below(1 << 31);
-        let mut swarm = self.make_swarm(&secret, &storage, salt);
-        swarm.restore(stored, true);
+        let mut swarm = self.make_swarm(&secret, &storage, salt, reading);
+        if reading {
+            // Nothing is read until needed; `check_integrity` reads it all back later.
+            if let Err(e) = swarm.load()
+                && let Some(n) = self.nodes.get_mut(i)
+            {
+                n.events.push(Event::StorageFailed(e));
+            }
+        } else {
+            let stored: Vec<Entry> = storage.0.lock().map(|v| v.clone()).unwrap_or_default();
+            swarm.restore(stored, true);
+        }
         for p in &bootstrap {
             swarm.add_peer(*p, Vec::new());
         }
@@ -548,7 +630,8 @@ impl Sim {
     pub fn check_integrity(&self) -> Result<(), String> {
         let mut seen: BTreeMap<(PeerId, u64), Vec<u8>> = BTreeMap::new();
         for (i, n) in self.nodes.iter().enumerate() {
-            for e in n.swarm.since(&Vector::new(), usize::MAX) {
+            let all = n.swarm.try_since(&Vector::new(), usize::MAX).map_err(|e| format!("node {i} can't read its log: {e}"))?;
+            for e in all {
                 match seen.get(&(e.author, e.seq)) {
                     Some(p) if *p != e.payload => return Err(format!("node {i} holds a different {}:{}", e.author.short(), e.seq)),
                     Some(_) => {}

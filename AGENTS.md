@@ -18,8 +18,9 @@ teams, chat or boards here.
 - Never crash: no unwrap/expect/panic outside tests; `unsafe` is forbidden; network input is hostile.
 - Protocol or behaviour changes need simulator coverage; run the chaos test and a fuzz session.
 - Wire format changes raise the protocol version in `Hello` (peers refuse older, accept newer).
-- Public API used by apps: `Swarm` (`new`, `restore`, `since`, `publish`, `set_storage`, …),
-  `Entry`, `Storage`, `Identity`, `verify`, `murmur_iroh::{Node, relay_map, n0_relays, …}`. Change
+- Public API used by apps: `Swarm` (`new`, `restore`, `load`, `since`, `replay`, `publish`,
+  `set_storage`, …), `Entry`, `Storage` (read methods have defaults), `file::FileStorage`, `codec`,
+  `Identity`, `verify`, `murmur_iroh::{Node, relay_map, n0_relays, …}`. Change
   it only on purpose, note it in the commit, and tell the apps (they bump their rev).
 
 ## Work

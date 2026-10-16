@@ -268,7 +268,11 @@ pub fn chaos(seed: u64) {
     let mut rng = Rng::new(seed * 7919);
     let n = 8 + rng.below(25) as usize;
     let c = Config { target_degree: 3 + rng.below(4) as usize, max_degree: 8, presence_interval: Some(3_000), ..Config::default() };
+    // A third of the runs have no reading peers, a third some, a third only, with small windows.
+    let reading = rng.below(3) as f64 / 2.0;
+    let c = Config { ram_window: [0, 500, 4_000][rng.below(3) as usize], ..c };
     let net = Net {
+        reading,
         latency: (5, 5 + rng.below(200)),
         dial_fail: 0.15,
         link_break: 0.003,
@@ -346,6 +350,11 @@ pub fn chaos(seed: u64) {
     for (i, node) in sim.nodes.iter().enumerate() {
         assert!(!node.events.iter().any(|e| matches!(e, Event::Conflict { .. })), "seed {seed}: node {i} saw a conflict");
         assert!(
+            !node.events.iter().any(|e| matches!(e, Event::StorageFailed(_))),
+            "seed {seed}: node {i}: {:?}",
+            node.events.iter().find(|e| matches!(e, Event::StorageFailed(_)))
+        );
+        assert!(
             !node.events.iter().any(|e| matches!(e, Event::Misbehaved { .. })),
             "seed {seed}: node {i} saw misbehaviour: {:?}",
             node.events.iter().find(|e| matches!(e, Event::Misbehaved { .. }))
@@ -375,4 +384,90 @@ fn a_restarted_peer_reconnects_before_the_old_link_times_out() {
             sim.run_for(15_000);
         }
     }
+}
+
+/// Bytes a reading peer may hold in memory: per author the window plus one chunk or entry.
+fn ram_bound(sim: &Sim, i: usize) -> usize {
+    let n = &sim.nodes[i];
+    n.swarm.vector().len() * (n.swarm.config().ram_window + (32 << 10) + 300)
+}
+
+fn no_storage_failures(sim: &Sim) {
+    for (i, n) in sim.nodes.iter().enumerate() {
+        assert!(!n.events.iter().any(|e| matches!(e, Event::StorageFailed(_))), "node {i}: {:?}", n.events);
+    }
+}
+
+#[test]
+fn reading_peers_keep_a_small_window_and_serve_old_entries() {
+    let c = Config { ram_window: 1_000, ..cfg() };
+    let mut sim = Sim::new(6, c, Net { reading: 1.0, ..Net::default() }, 21);
+    sim.bootstrap_star();
+    for round in 0..200 {
+        for i in 0..6 {
+            sim.publish(i, format!("node {i} entry {round} with some text").as_bytes()).expect("publish");
+        }
+        sim.run_for(50);
+    }
+    assert_converged(&mut sim, 30_000, "reading peers");
+    for i in 0..6 {
+        let ram = sim.nodes[i].swarm.ram_bytes();
+        assert!(ram <= ram_bound(&sim, i), "node {i} holds {ram} bytes");
+        assert!(ram < 1200 * 100 / 4, "node {i} keeps most entries out of memory ({ram} bytes)");
+    }
+    // A late joiner gets everything, almost all of it read back from storage by the others.
+    let j = sim.add_node();
+    sim.nodes[j].profile.reading = true;
+    sim.introduce(j, 2);
+    assert_converged(&mut sim, 60_000, "late joiner");
+    assert_eq!(sim.nodes[j].swarm.len(), 1200);
+    // Restarts load from storage without reading every entry, then go on.
+    sim.restart(3);
+    assert_eq!(sim.nodes[3].swarm.len(), 1200, "loaded");
+    assert_eq!(sim.nodes[3].swarm.ram_bytes(), 0, "nothing read yet");
+    let e = sim.publish(3, b"after restart").expect("publish");
+    assert_eq!(e.seq, 201);
+    let mut n = 0;
+    assert_eq!(sim.nodes[3].swarm.replay(&murmur::Vector::new(), |_| n += 1), Ok(1201));
+    assert_eq!(n, 1201);
+    assert_converged(&mut sim, 20_000, "after restart");
+    no_storage_failures(&sim);
+}
+
+#[test]
+fn a_restarted_reading_peer_alone_brings_a_newcomer_up_to_date() {
+    // Node 0 reads from storage with a tiny window; it is the only peer online when a newcomer
+    // arrives, after a restart, so every old entry it sends comes from its storage.
+    let c = Config { ram_window: 0, ..cfg() };
+    let mut sim = Sim::new(3, c, Net::default(), 22);
+    sim.nodes[0].profile.reading = true;
+    sim.restart(0);
+    sim.bootstrap_star();
+    let payload = vec![5u8; 150];
+    for _ in 0..2_000 {
+        sim.publish(1, &payload).expect("publish");
+        sim.publish(2, &payload).expect("publish");
+    }
+    assert_converged(&mut sim, 30_000, "warm-up");
+    sim.set_online(1, false);
+    sim.set_online(2, false);
+    sim.restart(0);
+    assert_eq!(sim.nodes[0].swarm.ram_bytes(), 0);
+    let j = sim.add_node();
+    sim.introduce(j, 0);
+    let took = sim.run_until(60_000, |s| s.nodes[j].swarm.len() == 4_000);
+    assert!(took.is_some(), "newcomer has {}", sim.nodes[j].swarm.len());
+    assert!(sim.nodes[0].swarm.ram_bytes() <= ram_bound(&sim, 0));
+    // And a wiped reading peer recovers its own log from the others before publishing.
+    for i in [1, 2] {
+        sim.set_online(i, true);
+    }
+    sim.nodes[1].profile.reading = true;
+    sim.wipe(1);
+    assert_eq!(sim.publish(1, b"too early"), Err(PublishError::NotSynced));
+    assert_converged(&mut sim, 60_000, "recovery");
+    let e = sim.publish(1, b"after recovery").expect("publish");
+    assert_eq!(e.seq, 2_001);
+    assert_converged(&mut sim, 10_000, "after");
+    no_storage_failures(&sim);
 }

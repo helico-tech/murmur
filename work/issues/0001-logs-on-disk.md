@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 type: debt
 created: 2026-10-16
 ---
@@ -46,3 +46,33 @@ Two phases, one commit each, on branch `memory`.
   bytes, so it includes parsing): 100k entries 26 MB (260 B/entry), restore 34 ms, since 9 ms;
   1M entries 255 MB (255 B/entry, payload ~199 B), restore 342 ms, since 89 ms. `since` is slower
   (it decodes and allocates every entry) but a 1 MiB catch-up window still takes ~0.3 ms.
+- 2026-10-16: phase 2 done. `Storage::{can_read, heads, read}` with defaults; `Config::ram_window`;
+  `Swarm::{load, replay, try_since}`; `murmur::file::FileStorage`; ADR 0002. Requirements from
+  Thime built in: `since` still returns old entries (read through the storage) and never a part
+  (on a failed read: nothing plus `StorageFailed`; `try_since` and `replay` return the error);
+  `replay` walks everything without holding it; `restore` keeps everything it gets.
+  Simulator: `Net::reading`, `Profile::reading`, `MemStorage::reader()`; two new scenarios; chaos
+  draws reading peers and windows of 0–4 KB; the fuzzer gives half its scenarios reading peers
+  (windows 0–256 KiB) and checks their memory bound. Chaos 1000 seeds: ok (297 s). Fuzz 12 min,
+  85 scenarios, 0 failures.
+- Follow-ups: [0006](0006-faster-file-replay.md) (replay from the file is ~0.7 µs/entry),
+  [0007](0007-reading-storage-in-browsers.md) (browsers). The apps still need to switch their
+  desktop stores to a reading storage and fold with `replay` to gain from phase 2.
+
+## Results (2026-10-16, M-series Mac, release build, payload ~200 B, 20 authors)
+`cargo run --release -p murmur --example bench -- --entries N --payload 200 [--file]`
+
+| | before | phase 1 (packed) | phase 2 (`FileStorage`) |
+|---|---|---|---|
+| RAM, 100k entries | 50 MB (504 B/entry) | 26 MB (259 B/entry) | 1.5 MB (15 B/entry) |
+| RAM, 1M entries | 506 MB (506 B/entry) | 255 MB (255 B/entry) | 10.5 MB (10 B/entry) |
+| start, 1M (parse + restore / open + load) | 268 + 61 ms | 348 ms (streamed) | 286 ms + 0 ms |
+| `since()` everything, 1M | 25 ms | 97 ms | 618 ms |
+| full fold, 1M (`replay`) | – | 26 ms | 672 ms |
+| `since()` of 4096 old entries (a catch-up window) | – | 0.5 ms | 3.2 ms |
+
+- Phase 1 is payload + ~60 B per entry (64 B signature + 2 B offset, author and seq implicit).
+- Phase 2 keeps the file index (8 B/entry) plus `ram_window` (256 KiB) per author. Reading old
+  entries costs one positioned read each (~0.65 µs).
+- Phase 2 is desktop/CLI only; web apps keep the default storage (see Notes).
+

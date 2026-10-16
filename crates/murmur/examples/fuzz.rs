@@ -8,7 +8,8 @@
 //!
 //! **Scenario mode** (default): random scenarios, one per seed. Each picks a swarm size, config and
 //! network (latency, bandwidth, slow peers, stalls, clock skew, NAT, failing dials, breaking
-//! links, small send queues) and some dishonest peers, then runs a random storm of publishes
+//! links, small send queues), some dishonest peers and, in half of them, peers that keep only a
+//! small window of each log in memory and read the rest back from storage, then runs a random storm of publishes
 //! (small and large), app flashes, flaps, offline periods, restarts, partitions and newcomers.
 //! While it runs, safety is checked (identical, correctly signed data everywhere; storage keeps
 //! up; degrees and buffers bounded; honest peers never accuse each other). Then the storm stops
@@ -181,6 +182,9 @@ fn random_net(rng: &mut Rng) -> Net {
         queue_limit: [512usize, 1024, 4096][rng.below(3) as usize],
         skew: rng.below(120_000),
         nat: rng.below(40) as f64 / 100.0,
+        // Half the scenarios have peers that keep only a small window of each log in memory and
+        // read the rest back from storage.
+        reading: if rng.below(2) == 0 { 0.0 } else { (1 + rng.below(100)) as f64 / 100.0 },
     }
 }
 
@@ -197,6 +201,7 @@ fn random_config(rng: &mut Rng) -> Config {
         probe_window: 1 << (12 + rng.below(5)),
         batch_bytes: 1 << (12 + rng.below(7)),
         eager_gap: rng.below(128),
+        ram_window: [0, 300, 2_000, 16 << 10, 256 << 10][rng.below(5) as usize],
         ..Config::default()
     }
 }
@@ -232,6 +237,11 @@ fn check_safety(sim: &Sim, deep: bool) -> Result<(), String> {
         }
         if n.profile.evil {
             continue;
+        }
+        // A reading peer keeps at most the window plus one chunk (or one big entry) per author.
+        let window = n.swarm.config().ram_window + (32 << 10) + (64 << 10) + 64;
+        if n.profile.reading && n.swarm.ram_bytes() > n.swarm.vector().len() * window {
+            return Err(format!("node {i} holds {} bytes in memory for {} authors", n.swarm.ram_bytes(), n.swarm.vector().len()));
         }
         for e in &n.events {
             match e {
