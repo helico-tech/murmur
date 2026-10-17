@@ -2,7 +2,7 @@
 
 Eventually consistent, fast replication of **signed append-only logs** among N peers, with no
 server. Each peer writes only its own log (ed25519-signed entries); every peer ends up with every
-log. Used by [OpenTeams](https://github.com/helico-tech/openteams) and Thime.
+log. Used by [OpenTeams](https://github.com/helico-tech/openteams) and Thyme.
 
 - **`murmur`**: the sans-IO core. A `Swarm` per group of peers: a small random overlay, instant
   push of new entries, version vectors with digests, windowed catch-up, anti-entropy, presence

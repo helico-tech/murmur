@@ -7,7 +7,7 @@ created: 2026-10-16
 
 ## Problem
 Apps store murmur entries as JSON lines (hex author, base64 payload and signature): OpenTeams
-measured 459 bytes for a 60-character chat message. Both apps (OpenTeams, Thime) need the same
+measured 459 bytes for a 60-character chat message. Both apps (OpenTeams, Thyme) need the same
 smaller format, so it belongs here, not in each app's store.
 
 ## Notes

@@ -1,7 +1,7 @@
 # murmur: instructions for agents
 
 A replication library for signed append-only logs among N peers (see README.md). Apps
-(OpenTeams, Thime) use it as a git dependency pinned to a rev. Keep it app-neutral: nothing about
+(OpenTeams, Thyme) use it as a git dependency pinned to a rev. Keep it app-neutral: nothing about
 teams, chat or boards here.
 
 ## Build, test

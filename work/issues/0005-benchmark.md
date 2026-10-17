@@ -14,7 +14,7 @@ or snapshots.
   format, then: bytes on disk, resident memory of a restored `Swarm`, time to restore and to
   iterate `since()`. Apps add their own fold timing on top.
 - Cases: OpenTeams busy team (50 people × 100 messages a day, ~1.8M entries in a year; also
-  100k); Thime busy grocery board (~100k entries in 3 years, 40–90 a day, ~45-byte payloads).
+  100k); Thyme busy grocery board (~100k entries in 3 years, 40–90 a day, ~45-byte payloads).
 - Measure natively and in the browser (wasm), since phones are the tight case.
 
 ## Results (2026-10-16, M-series Mac, release build)

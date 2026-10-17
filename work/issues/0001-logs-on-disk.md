@@ -48,7 +48,7 @@ Two phases, one commit each, on branch `memory`.
   (it decodes and allocates every entry) but a 1 MiB catch-up window still takes ~0.3 ms.
 - 2026-10-16: phase 2 done. `Storage::{can_read, heads, read}` with defaults; `Config::ram_window`;
   `Swarm::{load, replay, try_since}`; `murmur::file::FileStorage`; ADR 0002. Requirements from
-  Thime built in: `since` still returns old entries (read through the storage) and never a part
+  Thyme built in: `since` still returns old entries (read through the storage) and never a part
   (on a failed read: nothing plus `StorageFailed`; `try_since` and `replay` return the error);
   `replay` walks everything without holding it; `restore` keeps everything it gets.
   Simulator: `Net::reading`, `Profile::reading`, `MemStorage::reader()`; two new scenarios; chaos
